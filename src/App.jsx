@@ -293,96 +293,24 @@ const actionTargets = {
 }
 
 const schemeTabs = ['Marcinkowice', 'Biegonice', 'Nowy Sącz']
-const databaseName = 'plk-files'
-const fileStoreName = 'scheme-files'
-const notesStoreName = 'notes'
 
-function openFilesDatabase() {
-  return new Promise((resolve, reject) => {
-    const request = indexedDB.open(databaseName, 2)
+async function fetchJson(path, options) {
+  const response = await fetch(path, options)
 
-    request.onupgradeneeded = () => {
-      const database = request.result
+  if (!response.ok) {
+    throw new Error(`Request failed: ${response.status}`)
+  }
 
-      if (!database.objectStoreNames.contains(fileStoreName)) {
-        const store = database.createObjectStore(fileStoreName, { keyPath: 'id' })
-        store.createIndex('scheme', 'scheme', { unique: false })
-      }
-
-      if (!database.objectStoreNames.contains(notesStoreName)) {
-        const store = database.createObjectStore(notesStoreName, { keyPath: 'id' })
-        store.createIndex('createdAt', 'createdAt', { unique: false })
-      }
-    }
-
-    request.onsuccess = () => resolve(request.result)
-    request.onerror = () => reject(request.error)
-  })
+  return response.json()
 }
 
-async function getStoredNotes() {
-  const database = await openFilesDatabase()
-
+function readFileAsBase64(file) {
   return new Promise((resolve, reject) => {
-    const transaction = database.transaction(notesStoreName, 'readonly')
-    const request = transaction.objectStore(notesStoreName).getAll()
+    const reader = new FileReader()
 
-    request.onsuccess = () => {
-      resolve(request.result.toSorted((first, second) => second.createdAt - first.createdAt))
-    }
-    request.onerror = () => reject(request.error)
-    transaction.oncomplete = () => database.close()
-  })
-}
-
-async function saveStoredNote(note) {
-  const database = await openFilesDatabase()
-
-  return new Promise((resolve, reject) => {
-    const transaction = database.transaction(notesStoreName, 'readwrite')
-
-    transaction.objectStore(notesStoreName).put(note)
-    transaction.oncomplete = () => {
-      database.close()
-      resolve()
-    }
-    transaction.onerror = () => {
-      database.close()
-      reject(transaction.error)
-    }
-  })
-}
-
-async function getStoredSchemeFiles() {
-  const database = await openFilesDatabase()
-
-  return new Promise((resolve, reject) => {
-    const transaction = database.transaction(fileStoreName, 'readonly')
-    const request = transaction.objectStore(fileStoreName).getAll()
-
-    request.onsuccess = () => resolve(request.result)
-    request.onerror = () => reject(request.error)
-    transaction.oncomplete = () => database.close()
-  })
-}
-
-async function saveStoredSchemeFiles(files) {
-  const database = await openFilesDatabase()
-
-  return new Promise((resolve, reject) => {
-    const transaction = database.transaction(fileStoreName, 'readwrite')
-    const store = transaction.objectStore(fileStoreName)
-
-    files.forEach((file) => store.put(file))
-
-    transaction.oncomplete = () => {
-      database.close()
-      resolve()
-    }
-    transaction.onerror = () => {
-      database.close()
-      reject(transaction.error)
-    }
+    reader.onload = () => resolve(String(reader.result).split(',')[1] ?? '')
+    reader.onerror = () => reject(reader.error)
+    reader.readAsDataURL(file)
   })
 }
 
@@ -583,23 +511,14 @@ function SchematyPage({ onBack }) {
   )
   const [selectedFileId, setSelectedFileId] = useState(null)
   const [databaseStatus, setDatabaseStatus] = useState('loading')
-  const fileUrls = useRef([])
 
   const activeFiles = schemeFiles[activeScheme] ?? []
   const selectedFile = activeFiles.find((file) => file.id === selectedFileId) ?? null
 
   useEffect(() => {
-    const urls = fileUrls.current
-
-    return () => {
-      urls.forEach((url) => URL.revokeObjectURL(url))
-    }
-  }, [])
-
-  useEffect(() => {
     let isActive = true
 
-    getStoredSchemeFiles()
+    fetchJson('/api/files')
       .then((storedFiles) => {
         if (!isActive) {
           return
@@ -608,9 +527,7 @@ function SchematyPage({ onBack }) {
         const groupedFiles = Object.fromEntries(schemeTabs.map((tab) => [tab, []]))
 
         storedFiles.forEach((file) => {
-          const url = URL.createObjectURL(file.blob)
-          fileUrls.current.push(url)
-          groupedFiles[file.scheme]?.push({ ...file, url })
+          groupedFiles[file.scheme]?.push(file)
         })
 
         setSchemeFiles(groupedFiles)
@@ -634,50 +551,44 @@ function SchematyPage({ onBack }) {
       return
     }
 
-    const filesToAdd = selectedFiles.flatMap((file) => {
+    const filesToAdd = await Promise.all(selectedFiles.map(async (file) => {
       const customName = file.type === 'application/pdf'
         ? window.prompt('Podaj nazwę pliku PDF', file.name.replace(/\.pdf$/i, ''))
         : null
 
       if (file.type === 'application/pdf' && customName === null) {
-        return []
+        return null
       }
 
-      const url = URL.createObjectURL(file)
-      fileUrls.current.push(url)
+      return fetchJson('/api/files', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          data: await readFileAsBase64(file),
+          scheme: activeScheme,
+          name: customName?.trim() || file.name,
+          originalName: file.name,
+          type: file.type,
+          size: file.size,
+        }),
+      })
+    }))
+    const savedFiles = filesToAdd.filter(Boolean)
 
-      return [{
-        id: `${file.name}-${file.lastModified}-${crypto.randomUUID()}`,
-        scheme: activeScheme,
-        name: customName?.trim() || file.name,
-        originalName: file.name,
-        type: file.type,
-        size: file.size,
-        blob: file,
-        url,
-      }]
-    })
-
-    if (filesToAdd.length === 0) {
+    if (savedFiles.length === 0) {
       event.target.value = ''
       return
     }
-
-    await saveStoredSchemeFiles(filesToAdd.map((file) => {
-      const storedFile = { ...file }
-      delete storedFile.url
-      return storedFile
-    }))
 
     setSchemeFiles((currentFiles) => ({
       ...currentFiles,
       [activeScheme]: [
         ...(currentFiles[activeScheme] ?? []),
-        ...filesToAdd,
+        ...savedFiles,
       ],
     }))
 
-    setSelectedFileId(filesToAdd.at(-1).id)
+    setSelectedFileId(savedFiles.at(-1).id)
 
     event.target.value = ''
   }
@@ -795,7 +706,7 @@ function NotatkiPage({ onBack }) {
   useEffect(() => {
     let isActive = true
 
-    getStoredNotes()
+    fetchJson('/api/notes')
       .then((storedNotes) => {
         if (isActive) {
           setNotes(storedNotes)
@@ -821,23 +732,24 @@ function NotatkiPage({ onBack }) {
       return
     }
 
-    const note = {
-      id: crypto.randomUUID(),
-      crossedOut: false,
-      createdAt: Date.now(),
-      text: trimmedNote,
-    }
+    const note = await fetchJson('/api/notes', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: trimmedNote }),
+    })
 
-    await saveStoredNote(note)
     setNotes((currentNotes) => [note, ...currentNotes])
     setNoteDraft('')
     setNoteModalOpen(false)
   }
 
   const crossOutNote = async (note) => {
-    const updatedNote = { ...note, crossedOut: true }
+    const updatedNote = await fetchJson(`/api/notes/${note.id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ crossedOut: true }),
+    })
 
-    await saveStoredNote(updatedNote)
     setNotes((currentNotes) =>
       currentNotes.map((currentNote) =>
         currentNote.id === note.id ? updatedNote : currentNote,
